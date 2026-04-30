@@ -10,10 +10,19 @@ import {
   Program,
   Type,
   Scalar,
+  ModelProperty,
+  Diagnostic,
 } from "@typespec/compiler";
+import {
+  isReservedKeyword,
+  checkReservedKeyword,
+  formatReservedError,
+  formatReservedWarning,
+} from "@specodec/typespec-specodec-core";
 
 export type EmitterOptions = {
   "emitter-output-dir": string;
+  "ignore-reserved-keywords"?: boolean;
 };
 
 interface FieldInfo {
@@ -29,6 +38,18 @@ interface ServiceInfo {
   models: Model[];
 }
 
+const PY_KEYWORDS = new Set([
+  "False", "None", "True", "and", "as", "assert", "async", "await",
+  "break", "class", "continue", "def", "del", "elif", "else", "except",
+  "finally", "for", "from", "global", "if", "import", "in", "is",
+  "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try",
+  "while", "with", "yield",
+]);
+
+function safeName(name: string): string {
+  return PY_KEYWORDS.has(name) ? name + "_" : name;
+}
+
 function extractFields(model: Model): FieldInfo[] {
   const fields: FieldInfo[] = [];
   for (const [name, prop] of model.properties) {
@@ -37,7 +58,7 @@ function extractFields(model: Model): FieldInfo[] {
   return fields;
 }
 
-function snake(s: string): string {
+function snakeName(s: string): string {
   return s.replace(/([A-Z])/g, (m, c, i) => (i ? "_" : "") + c.toLowerCase());
 }
 
@@ -60,7 +81,8 @@ function typeToPython(type: Type, optional: boolean = false): string {
   return optional ? `Optional[${base}]` : base;
 }
 
-function writeJsonExpr(type: Type, varExpr: string, indent: string): string[] {
+// Returns lines (each prefixed with indent)
+function writeJsonLines(type: Type, varExpr: string, indent: string): string[] {
   const n = scalarName(type);
   if (n === "string") return [`${indent}w.write_string(${varExpr})`];
   if (n === "boolean") return [`${indent}w.write_bool(${varExpr})`];
@@ -77,15 +99,15 @@ function writeJsonExpr(type: Type, varExpr: string, indent: string): string[] {
       `${indent}w.begin_array(len(${varExpr}))`,
       `${indent}for _e in ${varExpr}:`,
       `${indent}    w.next_element()`,
-      ...writeJsonExpr(elem, "_e", indent + "    "),
+      ...writeJsonLines(elem, "_e", indent + "    "),
       `${indent}w.end_array()`,
     ];
   }
-  if (type.kind === "Model" && type.name) return [`${indent}${type.name}Codec.encode_json_into(w, ${varExpr})`];
+  if (type.kind === "Model" && type.name) return [`${indent}_write_json_${snakeName(type.name)}(w, ${varExpr})`];
   return [`${indent}w.write_string(str(${varExpr}))`];
 }
 
-function writeMsgPackExpr(type: Type, varExpr: string, indent: string): string[] {
+function writeMsgPackLines(type: Type, varExpr: string, indent: string): string[] {
   const n = scalarName(type);
   if (n === "string") return [`${indent}w.write_string(${varExpr})`];
   if (n === "boolean") return [`${indent}w.write_bool(${varExpr})`];
@@ -102,11 +124,11 @@ function writeMsgPackExpr(type: Type, varExpr: string, indent: string): string[]
       `${indent}w.begin_array(len(${varExpr}))`,
       `${indent}for _e in ${varExpr}:`,
       `${indent}    w.next_element()`,
-      ...writeMsgPackExpr(elem, "_e", indent + "    "),
+      ...writeMsgPackLines(elem, "_e", indent + "    "),
       `${indent}w.end_array()`,
     ];
   }
-  if (type.kind === "Model" && type.name) return [`${indent}${type.name}Codec.encode_msgpack_into(w, ${varExpr})`];
+  if (type.kind === "Model" && type.name) return [`${indent}_write_msgpack_${snakeName(type.name)}(w, ${varExpr})`];
   return [`${indent}w.write_string(str(${varExpr}))`];
 }
 
@@ -122,27 +144,104 @@ function readExpr(type: Type): string {
   if (["float64","float","decimal"].includes(n)) return `r.read_float64()`;
   if (n === "bytes") return `r.read_bytes()`;
   if (type.kind === "Model" && (type as Model).indexer) {
-    return `_decode_array(r, lambda: ${readExpr((type as Model).indexer!.value)})`;
+    const elem = (type as Model).indexer!.value;
+    return `_decode_array(r, lambda: ${readExpr(elem)})`;
   }
-  if (type.kind === "Model" && type.name) return `${type.name}Codec.decode(r)`;
+  if (type.kind === "Model" && type.name) return `_decode_${snakeName(type.name)}(r)`;
   return `r.read_string()`;
+}
+
+function emitModelFunctions(m: Model, L: string[]): void {
+  if (!m.name) return;
+  const fields = extractFields(m);
+  const required = fields.filter(f => !f.optional);
+  const optional = fields.filter(f => f.optional);
+  const sn = snakeName(m.name);
+
+  // _write_json_${name}(w, obj)
+  L.push(`def _write_json_${sn}(w: JsonWriter, obj: ${m.name}) -> None:`);
+  if (fields.length === 0) {
+    L.push(`    w.begin_object()`);
+    L.push(`    w.end_object()`);
+  } else {
+    L.push(`    w.begin_object()`);
+    for (const f of fields) {
+      const fsn = safeName(f.name);
+      if (f.optional) {
+        L.push(`    if obj.${fsn} is not None:`);
+        L.push(`        w.write_field("${f.name}")`);
+        for (const line of writeJsonLines(f.type, `obj.${fsn}`, "        ")) L.push(line);
+      } else {
+        L.push(`    w.write_field("${f.name}")`);
+        for (const line of writeJsonLines(f.type, `obj.${fsn}`, "    ")) L.push(line);
+      }
+    }
+    L.push(`    w.end_object()`);
+  }
+  L.push("");
+
+  // _write_msgpack_${name}(w, obj)
+  L.push(`def _write_msgpack_${sn}(w: MsgPackWriter, obj: ${m.name}) -> None:`);
+  if (optional.length === 0) {
+    L.push(`    w.begin_object(${fields.length})`);
+  } else {
+    L.push(`    _n = ${required.length}`);
+    for (const f of optional) {
+      L.push(`    if obj.${safeName(f.name)} is not None: _n += 1`);
+    }
+    L.push(`    w.begin_object(_n)`);
+  }
+  for (const f of fields) {
+    const fsn = safeName(f.name);
+    if (f.optional) {
+      L.push(`    if obj.${fsn} is not None:`);
+      L.push(`        w.write_field("${f.name}")`);
+      for (const line of writeMsgPackLines(f.type, `obj.${fsn}`, "        ")) L.push(line);
+    } else {
+      L.push(`    w.write_field("${f.name}")`);
+      for (const line of writeMsgPackLines(f.type, `obj.${fsn}`, "    ")) L.push(line);
+    }
+  }
+  L.push(`    w.end_object()`);
+  L.push("");
+
+  // _decode_${name}(r)
+  L.push(`def _decode_${sn}(r: SpecReader) -> ${m.name}:`);
+  L.push(`    _kw: dict = {}`);
+  L.push(`    r.begin_object()`);
+  L.push(`    while r.has_next_field():`);
+  L.push(`        _k = r.read_field_name()`);
+    for (const f of fields) {
+      L.push(`        if _k == "${f.name}": _kw["${safeName(f.name)}"] = ${readExpr(f.type)}; continue`);
+    }
+  L.push(`        r.skip()`);
+  L.push(`    r.end_object()`);
+  L.push(`    return ${m.name}(**_kw)`);
+  L.push("");
 }
 
 function collectServices(program: Program): ServiceInfo[] {
   const services = listServices(program);
   const result: ServiceInfo[] = [];
-  function collectFromNs(ns: Namespace) {
-    for (const [, iface] of ns.interfaces) {
-      const models: Model[] = [];
-      const seen = new Set<string>();
-      navigateTypesInNamespace(ns, {
-        model: (m: Model) => {
-          if (m.name && !seen.has(m.name)) { models.push(m); seen.add(m.name); }
-        },
+  
+  function collectFromNs(ns: Namespace, iface?: Interface) {
+    const models: Model[] = [];
+    const seen = new Set<string>();
+    navigateTypesInNamespace(ns, {
+      model: (m: Model) => {
+        if (m.name && !seen.has(m.name)) { models.push(m); seen.add(m.name); }
+      },
+    });
+    if (models.length > 0) {
+      result.push({ 
+        namespace: ns, 
+        iface: iface || { name: ns.name || "TestService", namespace: ns } as Interface, 
+        serviceName: iface?.name || ns.name || "TestService", 
+        models 
       });
-      result.push({ namespace: ns, iface, serviceName: iface.name, models });
     }
   }
+  
   for (const svc of services) collectFromNs(svc.type);
   if (result.length === 0) {
     const globalNs = program.getGlobalNamespaceType();
@@ -155,13 +254,48 @@ function collectServices(program: Program): ServiceInfo[] {
 export async function $onEmit(context: EmitContext<EmitterOptions>) {
   const program = context.program;
   const outputDir = context.emitterOutputDir;
+  const ignoreReservedKeywords = context.options["ignore-reserved-keywords"] ?? false;
   const services = collectServices(program);
+
+  // Check all field names for reserved keywords across all languages
+  const reservedFieldErrors: Diagnostic[] = [];
+  for (const svc of services) {
+    for (const m of svc.models) {
+      if (!m.name) continue;
+      for (const [fieldName, prop] of m.properties) {
+        const reservedIn = checkReservedKeyword(fieldName);
+        if (reservedIn.length > 0) {
+          const message = formatReservedError(fieldName, m.name, reservedIn);
+          const diag: Diagnostic = {
+            severity: "error",
+            code: "reserved-keyword",
+            message,
+            target: prop,
+          };
+          reservedFieldErrors.push(diag);
+        }
+      }
+    }
+  }
+
+  // If any reserved keywords found and not ignoring, report errors and abort
+  if (reservedFieldErrors.length > 0 && !ignoreReservedKeywords) {
+    program.reportDiagnostics(reservedFieldErrors);
+    return;
+  }
+
+  // If ignoring, just log warnings (but continue)
+  if (reservedFieldErrors.length > 0 && ignoreReservedKeywords) {
+    for (const diag of reservedFieldErrors) {
+      console.warn(`Warning: ${diag.message}`);
+    }
+  }
 
   for (const svc of services) {
     const L: string[] = [];
     L.push("# Generated by @specodec/typespec-specodec-python. DO NOT EDIT.");
     L.push("from __future__ import annotations");
-    L.push("from dataclasses import dataclass, field");
+    L.push("from dataclasses import dataclass");
     L.push("from typing import Optional, Any, Callable, List, TypeVar");
     L.push("from specodec import JsonWriter, MsgPackWriter, SpecReader, SpecCodec");
     L.push("");
@@ -176,108 +310,51 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
     L.push("    return result");
     L.push("");
 
+    // 1. Dataclasses (required first, then optional)
     for (const m of svc.models) {
       if (!m.name) continue;
       const fields = extractFields(m);
       const required = fields.filter(f => !f.optional);
       const optional = fields.filter(f => f.optional);
-
-      // dataclass
       L.push("@dataclass");
       L.push(`class ${m.name}:`);
       if (fields.length === 0) {
         L.push("    pass");
       } else {
-        for (const f of required) {
-          L.push(`    ${f.name}: ${typeToPython(f.type)}`);
-        }
-        for (const f of optional) {
-          L.push(`    ${f.name}: ${typeToPython(f.type, true)} = None`);
-        }
+        for (const f of required) L.push(`    ${safeName(f.name)}: ${typeToPython(f.type)}`);
+        for (const f of optional) L.push(`    ${safeName(f.name)}: ${typeToPython(f.type, true)} = None`);
       }
       L.push("");
+    }
 
-      // codec
-      L.push(`class _${m.name}Codec:`);
+    // 2. Internal helpers
+    for (const m of svc.models) {
+      emitModelFunctions(m, L);
+    }
 
-      // encode_json
-      L.push(`    @staticmethod`);
-      L.push(`    def encode_json(obj: ${m.name}) -> bytes:`);
-      L.push(`        w = JsonWriter()`);
-      L.push(`        _${m.name}Codec.encode_json_into(w, obj)`);
-      L.push(`        return w.to_bytes()`);
-
-      // encode_json_into
-      L.push(`    @staticmethod`);
-      L.push(`    def encode_json_into(w: JsonWriter, obj: ${m.name}) -> None:`);
-      L.push(`        w.begin_object()`);
-      for (const f of fields) {
-        if (f.optional) {
-          L.push(`        if obj.${f.name} is not None:`);
-          L.push(`            w.write_field("${f.name}")`);
-          for (const line of writeJsonExpr(f.type, `obj.${f.name}`, "            ")) L.push(line);
-        } else {
-          L.push(`        w.write_field("${f.name}")`);
-          for (const line of writeJsonExpr(f.type, `obj.${f.name}`, "        ")) L.push(line);
-        }
-      }
-      L.push(`        w.end_object()`);
-
-      // encode_msgpack
-      L.push(`    @staticmethod`);
-      L.push(`    def encode_msgpack(obj: ${m.name}) -> bytes:`);
-      L.push(`        w = MsgPackWriter()`);
-      L.push(`        _${m.name}Codec.encode_msgpack_into(w, obj)`);
-      L.push(`        return w.to_bytes()`);
-
-      // encode_msgpack_into
-      L.push(`    @staticmethod`);
-      L.push(`    def encode_msgpack_into(w: MsgPackWriter, obj: ${m.name}) -> None:`);
-      if (optional.length === 0) {
-        L.push(`        w.begin_object(${fields.length})`);
-      } else {
-        L.push(`        _n = ${required.length}`);
-        for (const f of optional) {
-          L.push(`        if obj.${f.name} is not None: _n += 1`);
-        }
-        L.push(`        w.begin_object(_n)`);
-      }
-      for (const f of fields) {
-        if (f.optional) {
-          L.push(`        if obj.${f.name} is not None:`);
-          L.push(`            w.write_field("${f.name}")`);
-          for (const line of writeMsgPackExpr(f.type, `obj.${f.name}`, "            ")) L.push(line);
-        } else {
-          L.push(`        w.write_field("${f.name}")`);
-          for (const line of writeMsgPackExpr(f.type, `obj.${f.name}`, "        ")) L.push(line);
-        }
-      }
-      L.push(`        w.end_object()`);
-
-      // decode
-      L.push(`    @staticmethod`);
-      L.push(`    def decode(r: SpecReader) -> ${m.name}:`);
-      L.push(`        _kw: dict = {}`);
-      L.push(`        r.begin_object()`);
-      L.push(`        while r.has_next_field():`);
-      L.push(`            _k = r.read_field_name()`);
-      for (const f of fields) {
-        L.push(`            if _k == "${f.name}": _kw["${f.name}"] = ${readExpr(f.type)}; continue`);
-      }
-      L.push(`            r.skip()`);
-      L.push(`        r.end_object()`);
-      L.push(`        return ${m.name}(**_kw)`);
-
+    // 3. Exported SpecCodec instances — wrap helpers in simple functions
+    for (const m of svc.models) {
+      if (!m.name) continue;
+      const sn = snakeName(m.name);
+      L.push(`def _encode_json_${sn}(obj: ${m.name}) -> bytes:`);
+      L.push(`    w = JsonWriter()`);
+      L.push(`    _write_json_${sn}(w, obj)`);
+      L.push(`    return w.to_bytes()`);
       L.push("");
-      L.push(`${m.name}Codec = SpecCodec(`);
-      L.push(`    encode_json=_${m.name}Codec.encode_json,`);
-      L.push(`    encode_msgpack=_${m.name}Codec.encode_msgpack,`);
-      L.push(`    decode=_${m.name}Codec.decode,`);
+      L.push(`def _encode_msgpack_${sn}(obj: ${m.name}) -> bytes:`);
+      L.push(`    w = MsgPackWriter()`);
+      L.push(`    _write_msgpack_${sn}(w, obj)`);
+      L.push(`    return w.to_bytes()`);
+      L.push("");
+      L.push(`${m.name}Codec: SpecCodec = SpecCodec(`);
+      L.push(`    encode_json=_encode_json_${sn},`);
+      L.push(`    encode_msgpack=_encode_msgpack_${sn},`);
+      L.push(`    decode=_decode_${sn},`);
       L.push(`)`);
       L.push("");
     }
 
-    const fileName = `${snake(svc.serviceName)}_types.py`;
+    const fileName = `${snakeName(svc.serviceName)}_types.py`;
     await emitFile(program, { path: `${outputDir}/${fileName}`, content: L.join("\n") });
   }
 }
