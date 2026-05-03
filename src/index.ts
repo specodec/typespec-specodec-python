@@ -1,23 +1,16 @@
 import {
   EmitContext,
   emitFile,
-  listServices,
-  navigateTypesInNamespace,
   Model,
-  Namespace,
-  Interface,
-  Program,
   Type,
   Scalar,
-  ModelProperty,
   Diagnostic,
 } from "@typespec/compiler";
 import {
-  isReservedKeyword,
   checkReservedKeyword,
   formatReservedError,
-  formatReservedWarning,
-  isSpecodecModel,
+  collectServices,
+  ServiceInfo,
 } from "@specodec/typespec-emitter-core";
 
 export type EmitterOptions = {
@@ -29,13 +22,6 @@ interface FieldInfo {
   name: string;
   type: Type;
   optional: boolean;
-}
-
-interface ServiceInfo {
-  namespace: Namespace;
-  iface: Interface;
-  serviceName: string;
-  models: Model[];
 }
 
 const PY_KEYWORDS = new Set([
@@ -90,7 +76,6 @@ function typeToPython(type: Type, optional: boolean = false): string {
   return optional ? `Optional[${base}]` : base;
 }
 
-// Single format-agnostic write lines using SpecWriter
 function writeLines(type: Type, varExpr: string, indent: string): string[] {
   const n = scalarName(type);
   if (n === "string") return [`${indent}w.write_string(${varExpr})`];
@@ -138,7 +123,7 @@ function readExpr(type: Type, optional?: boolean): string {
   if (n === "uint64") return `r.read_uint64()`;
   if (n === "float32") return `r.read_float32()`;
   if (["float64","float","decimal"].includes(n)) return `r.read_float64()`;
-if (n === "bytes") return `r.read_bytes()`;
+  if (n === "bytes") return `r.read_bytes()`;
   if (type.kind === "Model" && (type as Model).indexer) {
     const indexer = (type as Model).indexer!;
     const keyName = (indexer.key as any).name;
@@ -167,7 +152,6 @@ function emitModelFunctions(m: Model, L: string[]): void {
   const optional = fields.filter(f => f.optional);
   const sn = snakeName(m.name);
 
-  // _write_${sn}(w, obj) — format-agnostic using SpecWriter
   L.push(`def _write_${sn}(w: SpecWriter, obj: ${m.name}) -> None:`);
   if (optional.length === 0) {
     L.push(`    w.begin_object(${fields.length})`);
@@ -192,53 +176,18 @@ function emitModelFunctions(m: Model, L: string[]): void {
   L.push(`    w.end_object()`);
   L.push("");
 
-  // _decode_${name}(r)
   L.push(`def _decode_${sn}(r: SpecReader) -> ${m.name}:`);
   L.push(`    _kw: dict = {}`);
   L.push(`    r.begin_object()`);
   L.push(`    while r.has_next_field():`);
   L.push(`        _k = r.read_field_name()`);
-    for (const f of fields) {
-      L.push(`        if _k == "${f.name}": _kw["${safeName(f.name)}"] = ${readExpr(f.type, f.optional)}; continue`);
-    }
+  for (const f of fields) {
+    L.push(`        if _k == "${f.name}": _kw["${safeName(f.name)}"] = ${readExpr(f.type, f.optional)}; continue`);
+  }
   L.push(`        r.skip()`);
   L.push(`    r.end_object()`);
   L.push(`    return ${m.name}(**_kw)`);
   L.push("");
-}
-
-function collectServices(program: Program): ServiceInfo[] {
-  const services = listServices(program);
-  const result: ServiceInfo[] = [];
-  
-  function collectFromNs(ns: Namespace, iface?: Interface) {
-    const models: Model[] = [];
-    const seen = new Set<string>();
-    navigateTypesInNamespace(ns, {
-      model: (m: Model) => {
-        if (m.name && !seen.has(m.name) && isSpecodecModel(program, m)) {
-          models.push(m);
-          seen.add(m.name);
-        }
-      },
-    });
-    if (models.length > 0) {
-      result.push({ 
-        namespace: ns, 
-        iface: iface || { name: ns.name || "TestService", namespace: ns } as Interface, 
-        serviceName: iface?.name || ns.name || "TestService", 
-        models 
-      });
-    }
-  }
-  
-  for (const svc of services) collectFromNs(svc.type);
-  if (result.length === 0) {
-    const globalNs = program.getGlobalNamespaceType();
-    for (const [, ns] of globalNs.namespaces) collectFromNs(ns);
-    collectFromNs(globalNs);
-  }
-  return result;
 }
 
 export async function $onEmit(context: EmitContext<EmitterOptions>) {
@@ -247,7 +196,6 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
   const ignoreReservedKeywords = context.options["ignore-reserved-keywords"] ?? false;
   const services = collectServices(program);
 
-  // Check all field names for reserved keywords across all languages
   const reservedFieldErrors: Diagnostic[] = [];
   for (const svc of services) {
     for (const m of svc.models) {
@@ -268,13 +216,11 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
     }
   }
 
-  // If any reserved keywords found and not ignoring, report errors and abort
   if (reservedFieldErrors.length > 0 && !ignoreReservedKeywords) {
     program.reportDiagnostics(reservedFieldErrors);
     return;
   }
 
-  // If ignoring, just log warnings (but continue)
   if (reservedFieldErrors.length > 0 && ignoreReservedKeywords) {
     for (const diag of reservedFieldErrors) {
       console.warn(`Warning: ${diag.message}`);
@@ -300,7 +246,6 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
     L.push("    return result");
     L.push("");
 
-    // 1. Dataclasses (required first, then optional)
     for (const m of svc.models) {
       if (!m.name) continue;
       const fields = extractFields(m);
@@ -317,12 +262,10 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
       L.push("");
     }
 
-    // 2. Internal helpers
     for (const m of svc.models) {
       emitModelFunctions(m, L);
     }
 
-    // 3. Exported SpecCodec instances — wrap helpers in simple functions
     for (const m of svc.models) {
       if (!m.name) continue;
       const sn = snakeName(m.name);
