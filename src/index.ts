@@ -56,9 +56,9 @@ function writeLines(type: Type, varExpr: string, indent: string): string[] {
     const elem = arrayElementType(type);
     return [
       `${indent}w.begin_array(len(${varExpr}))`,
-      `${indent}for _e in ${varExpr}:`,
+      `${indent}for item in ${varExpr}:`,
       `${indent}    w.next_element()`,
-      ...writeLines(elem, "_e", indent + "    "),
+      ...writeLines(elem, "item", indent + "    "),
       `${indent}w.end_array()`,
     ];
   }
@@ -66,13 +66,13 @@ function writeLines(type: Type, varExpr: string, indent: string): string[] {
     const elem = recordElementType(type);
     return [
       `${indent}w.begin_object(len(${varExpr}))`,
-      `${indent}for _k, _v in ${varExpr}.items():`,
-      `${indent}    w.write_field(_k)`,
-      ...writeLines(elem, "_v", indent + "    "),
+      `${indent}for key, val in ${varExpr}.items():`,
+      `${indent}    w.write_field(key)`,
+      ...writeLines(elem, "val", indent + "    "),
       `${indent}w.end_object()`,
     ];
   }
-  if (type.kind === "Model" && (type as Model).name) return [`${indent}_write_${toSnakeCase((type as Model).name)}(w, ${varExpr})`];
+  if (type.kind === "Model" && (type as Model).name) return [`${indent}write_${toSnakeCase((type as Model).name)}(w, ${varExpr})`];
   return [`${indent}w.write_string(str(${varExpr}))`];
 }
 
@@ -89,19 +89,19 @@ function readExpr(type: Type, optional?: boolean): string {
   if (n === "bytes") return `r.read_bytes()`;
   if (isArrayType(type)) {
     const elem = arrayElementType(type);
-    const arrExpr = `(lambda: (_arr := [], r.begin_array(), [_arr.append(${readExpr(elem)}) for _ in iter(r.has_next_element, False)], r.end_array(), _arr)[-1])()`;
+    const arrExpr = `(lambda: (result := [], r.begin_array(), [result.append(${readExpr(elem)}) for _ in iter(r.has_next_element, False)], r.end_array(), result)[-1])()`;
     if (optional) return `r.read_null() if r.is_null() else ${arrExpr}`;
     return arrExpr;
   }
   if (isRecordType(type)) {
     const elem = recordElementType(type);
-    const mapExpr = `(lambda: (_map := {}, r.begin_object(), [_map.__setitem__(r.read_field_name(), ${readExpr(elem)}) for _ in iter(r.has_next_field, False)], r.end_object(), _map)[-1])()`;
+    const mapExpr = `(lambda: (result := {}, r.begin_object(), [result.__setitem__(r.read_field_name(), ${readExpr(elem)}) for _ in iter(r.has_next_field, False)], r.end_object(), result)[-1])()`;
     if (optional) return `r.read_null() if r.is_null() else ${mapExpr}`;
     return mapExpr;
   }
   if (type.kind === "Model" && (type as Model).name) {
-    if (optional) return `r.read_null() if r.is_null() else _decode_${toSnakeCase((type as Model).name)}(r)`;
-    return `_decode_${toSnakeCase((type as Model).name)}(r)`;
+    if (optional) return `r.read_null() if r.is_null() else decode_${toSnakeCase((type as Model).name)}(r)`;
+    return `decode_${toSnakeCase((type as Model).name)}(r)`;
   }
   return `r.read_string()`;
 }
@@ -113,39 +113,43 @@ function emitModelFunctions(m: Model, L: string[]): void {
   const optional = fields.filter(f => f.optional);
   const sn = toSnakeCase(m.name);
 
-  L.push(`def _write_${sn}(w: SpecWriter, obj: ${m.name}) -> None:`);
+  L.push(`def write_${sn}(w: SpecWriter, obj: ${m.name}) -> None:`);
   if (optional.length === 0) {
     L.push(`    w.begin_object(${fields.length})`);
   } else {
-    L.push(`    _n = ${required.length}`);
-    for (const f of optional) L.push(`    if obj.${safeName(f.name)} is not None: _n += 1`);
-    L.push(`    w.begin_object(_n)`);
+    L.push(`    field_count = ${required.length}`);
+    for (const f of optional) {
+      const fPy = safeName(toSnakeCase(f.name));
+      L.push(`    if obj.${fPy} is not None: field_count += 1`);
+    }
+    L.push(`    w.begin_object(field_count)`);
   }
   for (const f of fields) {
-    const fsn = safeName(f.name);
+    const fPy = safeName(toSnakeCase(f.name));
     if (f.optional) {
-      L.push(`    if obj.${fsn} is not None:`);
+      L.push(`    if obj.${fPy} is not None:`);
       L.push(`        w.write_field("${f.name}")`);
-      for (const line of writeLines(f.type, `obj.${fsn}`, "        ")) L.push(line);
+      for (const line of writeLines(f.type, `obj.${fPy}`, "        ")) L.push(line);
     } else {
       L.push(`    w.write_field("${f.name}")`);
-      for (const line of writeLines(f.type, `obj.${fsn}`, "    ")) L.push(line);
+      for (const line of writeLines(f.type, `obj.${fPy}`, "    ")) L.push(line);
     }
   }
   L.push(`    w.end_object()`);
   L.push("");
 
-  L.push(`def _decode_${sn}(r: SpecReader) -> ${m.name}:`);
-  L.push(`    _kw: dict = {}`);
+  L.push(`def decode_${sn}(r: SpecReader) -> ${m.name}:`);
+  L.push(`    kw: dict = {}`);
   L.push(`    r.begin_object()`);
   L.push(`    while r.has_next_field():`);
-  L.push(`        _k = r.read_field_name()`);
+  L.push(`        key = r.read_field_name()`);
   for (const f of fields) {
-    L.push(`        if _k == "${f.name}": _kw["${safeName(f.name)}"] = ${readExpr(f.type, f.optional)}; continue`);
+    const fPy = safeName(toSnakeCase(f.name));
+    L.push(`        if key == "${f.name}": kw["${fPy}"] = ${readExpr(f.type, f.optional)}; continue`);
   }
   L.push(`        r.skip()`);
   L.push(`    r.end_object()`);
-  L.push(`    return ${m.name}(**_kw)`);
+  L.push(`    return ${m.name}(**kw)`);
   L.push("");
 }
 
@@ -178,8 +182,14 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
       if (fields.length === 0) {
         L.push("    pass");
       } else {
-        for (const f of required) L.push(`    ${safeName(f.name)}: ${typeToPython(f.type)}`);
-        for (const f of optional) L.push(`    ${safeName(f.name)}: ${typeToPython(f.type, true)} = None`);
+        for (const f of required) {
+          const fPy = safeName(toSnakeCase(f.name));
+          L.push(`    ${fPy}: ${typeToPython(f.type)}`);
+        }
+        for (const f of optional) {
+          const fPy = safeName(toSnakeCase(f.name));
+          L.push(`    ${fPy}: ${typeToPython(f.type, true)} = None`);
+        }
       }
       L.push("");
     }
@@ -190,8 +200,8 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
       if (!m.name) continue;
       const sn = toSnakeCase(m.name);
       L.push(`${m.name}Codec: SpecCodec = SpecCodec(`);
-      L.push(`    encode=_write_${sn},`);
-      L.push(`    decode=_decode_${sn},`);
+      L.push(`    encode=write_${sn},`);
+      L.push(`    decode=decode_${sn},`);
       L.push(`)`);
       L.push("");
     }
