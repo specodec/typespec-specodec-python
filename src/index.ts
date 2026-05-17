@@ -44,6 +44,9 @@ function typeToPython(type: Type, optional: boolean = false): string {
   return optional ? `Optional[${base}]` : base;
 }
 
+let writeLoopCounter = 0;
+let fieldReadCounter = 0;
+
 function writeLines(type: Type, varExpr: string, indent: string): string[] {
   const n = scalarName(type);
   if (n === "string") return [`${indent}w.write_string(${varExpr})`];
@@ -57,21 +60,24 @@ function writeLines(type: Type, varExpr: string, indent: string): string[] {
   if (n === "bytes") return [`${indent}w.write_bytes(${varExpr})`];
   if (isArrayType(type)) {
     const elem = arrayElementType(type)!;
+    const it = `_it${writeLoopCounter++}`;
     return [
       `${indent}w.begin_array(len(${varExpr}))`,
-      `${indent}for item in ${varExpr}:`,
+      `${indent}for ${it} in ${varExpr}:`,
       `${indent}    w.next_element()`,
-      ...writeLines(elem, "item", `${indent}    `),
+      ...writeLines(elem, it, `${indent}    `),
       `${indent}w.end_array()`,
     ];
   }
   if (isRecordType(type)) {
     const elem = recordElementType(type)!;
+    const ki = `_k${writeLoopCounter++}`;
+    const vi = `_v${writeLoopCounter++}`;
     return [
       `${indent}w.begin_object(len(${varExpr}))`,
-      `${indent}for key, val in ${varExpr}.items():`,
-      `${indent}    w.write_field(key)`,
-      ...writeLines(elem, "val", `${indent}    `),
+      `${indent}for ${ki}, ${vi} in ${varExpr}.items():`,
+      `${indent}    w.write_field(${ki})`,
+      ...writeLines(elem, vi, `${indent}    `),
       `${indent}w.end_object()`,
     ];
   }
@@ -95,29 +101,67 @@ function readExpr(type: Type, optional?: boolean): string {
   if (n === "float32") return `r.read_float32()`;
   if (["float64", "float", "decimal"].includes(n)) return `r.read_float64()`;
   if (n === "bytes") return `r.read_bytes()`;
-  if (isArrayType(type)) {
-    const elem = arrayElementType(type)!;
-    const arrExpr = `(lambda: (result := [], r.begin_array(), [result.append(${readExpr(elem)}) for _ in iter(r.has_next_element, False)], r.end_array(), result)[-1])()`;
-    if (optional) return `r.read_null() if r.is_null() else ${arrExpr}`;
-    return arrExpr;
-  }
-  if (isRecordType(type)) {
-    const elem = recordElementType(type)!;
-    const mapExpr = `(lambda: (result := {}, r.begin_object(), [result.__setitem__(r.read_field_name(), ${readExpr(elem)}) for _ in iter(r.has_next_field, False)], r.end_object(), result)[-1])()`;
-    if (optional) return `r.read_null() if r.is_null() else ${mapExpr}`;
-    return mapExpr;
-  }
   if (type.kind === "Enum") return "r.read_string()";
   if (type.kind === "Model" && (type as Model).name) {
-    if (optional) return `r.read_null() if r.is_null() else decode_${toSnakeCase((type as Model).name)}(r)`;
     return `decode_${toSnakeCase((type as Model).name)}(r)`;
   }
   if (type.kind === "Union") {
     const sn = toSnakeCase((type as Union).name!);
-    if (optional) return `r.read_null() if r.is_null() else decode_${sn}(r)`;
     return `decode_${sn}(r)`;
   }
   return `r.read_string()`;
+}
+
+
+function generateFieldRead(L: string[], f: { name: string; type: Type; optional: boolean }, indent: string): string {
+  const type = f.type;
+  if (isArrayType(type)) {
+    const elem = arrayElementType(type)!;
+    const tmp = `_tmp${fieldReadCounter++}`;
+    const elemRead = readExpr(elem);
+    const inner = f.optional ? `    ` : ``;
+    if (f.optional) {
+      L.push(`${indent}if r.is_null():`);
+      L.push(`${indent}    ${tmp} = None`);
+      L.push(`${indent}    r.read_null()`);
+      L.push(`${indent}else:`);
+    }
+    L.push(`${indent}${inner}${tmp} = []`);
+    L.push(`${indent}${inner}r.begin_array()`);
+    L.push(`${indent}${inner}while r.has_next_element():`);
+    L.push(`${indent}${inner}    ${tmp}.append(${elemRead})`);
+    L.push(`${indent}${inner}r.end_array()`);
+    return tmp;
+  }
+  if (isRecordType(type)) {
+    const elem = recordElementType(type)!;
+    const tmp = `_tmp${fieldReadCounter++}`;
+    const elemRead = readExpr(elem);
+    const inner = f.optional ? `    ` : ``;
+    if (f.optional) {
+      L.push(`${indent}if r.is_null():`);
+      L.push(`${indent}    ${tmp} = None`);
+      L.push(`${indent}    r.read_null()`);
+      L.push(`${indent}else:`);
+    }
+    L.push(`${indent}${inner}${tmp} = {}`);
+    L.push(`${indent}${inner}r.begin_object()`);
+    L.push(`${indent}${inner}while r.has_next_field():`);
+    L.push(`${indent}${inner}    ${tmp}[r.read_field_name()] = ${elemRead}`);
+    L.push(`${indent}${inner}r.end_object()`);
+    return tmp;
+  }
+  if (f.optional && ((type.kind === "Model" && (type as Model).name) || type.kind === "Union")) {
+    const tmp = `_tmp${fieldReadCounter++}`;
+    const sn = toSnakeCase(type.kind === "Model" ? (type as Model).name! : (type as Union).name!);
+    L.push(`${indent}if r.is_null():`);
+    L.push(`${indent}    ${tmp} = None`);
+    L.push(`${indent}    r.read_null()`);
+    L.push(`${indent}else:`);
+    L.push(`${indent}    ${tmp} = decode_${sn}(r)`);
+    return tmp;
+  }
+  return readExpr(type);
 }
 
 function emitModelFunctions(m: Model, L: string[]): void {
@@ -157,9 +201,11 @@ function emitModelFunctions(m: Model, L: string[]): void {
   L.push(`    r.begin_object()`);
   L.push(`    while r.has_next_field():`);
   L.push(`        key = r.read_field_name()`);
+  fieldReadCounter = 0;
   for (const f of fields) {
     const fPy = fieldPy(f.name);
-    L.push(`        if key == "${f.name}": kw["${fPy}"] = ${readExpr(f.type, f.optional)}; continue`);
+    const val = generateFieldRead(L, f, "        ");
+    L.push(`        if key == "${f.name}": kw["${fPy}"] = ${val}; continue`);
   }
   L.push(`        r.skip()`);
   L.push(`    r.end_object()`);
@@ -257,7 +303,7 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
     L.push("from __future__ import annotations");
     L.push("import enum");
     L.push("from dataclasses import dataclass");
-    L.push("from typing import Optional, Any, Callable, List, TypeVar, Union");
+    L.push("from typing import Optional, Any, Callable, List, Union");
     L.push("from specodec import SpecWriter, SpecReader, SpecCodec, SpecUndefined");
 
     // Cross-namespace imports: re-export all functions from referenced parent namespaces
@@ -293,8 +339,6 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
       L.push(`from .${ns}_types import *`);
     }
 
-    L.push("");
-    L.push("T = TypeVar('T')");
     L.push("");
 
     for (const m of svc.models) {
