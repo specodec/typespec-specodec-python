@@ -113,55 +113,68 @@ function readExpr(type: Type, optional?: boolean): string {
 }
 
 
-function generateFieldRead(L: string[], f: { name: string; type: Type; optional: boolean }, indent: string): string {
+function generateFieldRead(f: { name: string; type: Type; optional: boolean }): { stmts: string[], value: string } {
   const type = f.type;
   if (isArrayType(type)) {
     const elem = arrayElementType(type)!;
-    const tmp = `_tmp`;
+    const tmp = `_tmp${fieldReadCounter++}`;
     const elemRead = readExpr(elem);
-    const inner = f.optional ? `    ` : ``;
+    const stmts: string[] = [];
     if (f.optional) {
-      L.push(`${indent}if r.is_null():`);
-      L.push(`${indent}    ${tmp} = None`);
-      L.push(`${indent}    r.read_null()`);
-      L.push(`${indent}else:`);
+      stmts.push(`${tmp} = None`);
+      stmts.push(`if r.is_null():`);
+      stmts.push(`    r.read_null()`);
+      stmts.push(`else:`);
+      stmts.push(`    ${tmp} = []`);
+      stmts.push(`    r.begin_array()`);
+      stmts.push(`    while r.has_next_element():`);
+      stmts.push(`        ${tmp}.append(${elemRead})`);
+      stmts.push(`    r.end_array()`);
+    } else {
+      stmts.push(`${tmp} = []`);
+      stmts.push(`r.begin_array()`);
+      stmts.push(`while r.has_next_element():`);
+      stmts.push(`    ${tmp}.append(${elemRead})`);
+      stmts.push(`r.end_array()`);
     }
-    L.push(`${indent}${inner}${tmp} = []`);
-    L.push(`${indent}${inner}r.begin_array()`);
-    L.push(`${indent}${inner}while r.has_next_element():`);
-    L.push(`${indent}${inner}    ${tmp}.append(${elemRead})`);
-    L.push(`${indent}${inner}r.end_array()`);
-    return tmp;
+    return { stmts, value: tmp };
   }
   if (isRecordType(type)) {
     const elem = recordElementType(type)!;
-    const tmp = `_tmp`;
+    const tmp = `_tmp${fieldReadCounter++}`;
     const elemRead = readExpr(elem);
-    const inner = f.optional ? `    ` : ``;
+    const stmts: string[] = [];
     if (f.optional) {
-      L.push(`${indent}if r.is_null():`);
-      L.push(`${indent}    ${tmp} = None`);
-      L.push(`${indent}    r.read_null()`);
-      L.push(`${indent}else:`);
+      stmts.push(`${tmp} = None`);
+      stmts.push(`if r.is_null():`);
+      stmts.push(`    r.read_null()`);
+      stmts.push(`else:`);
+      stmts.push(`    ${tmp} = {}`);
+      stmts.push(`    r.begin_object()`);
+      stmts.push(`    while r.has_next_field():`);
+      stmts.push(`        ${tmp}[r.read_field_name()] = ${elemRead}`);
+      stmts.push(`    r.end_object()`);
+    } else {
+      stmts.push(`${tmp} = {}`);
+      stmts.push(`r.begin_object()`);
+      stmts.push(`while r.has_next_field():`);
+      stmts.push(`    ${tmp}[r.read_field_name()] = ${elemRead}`);
+      stmts.push(`r.end_object()`);
     }
-    L.push(`${indent}${inner}${tmp} = {}`);
-    L.push(`${indent}${inner}r.begin_object()`);
-    L.push(`${indent}${inner}while r.has_next_field():`);
-    L.push(`${indent}${inner}    ${tmp}[r.read_field_name()] = ${elemRead}`);
-    L.push(`${indent}${inner}r.end_object()`);
-    return tmp;
+    return { stmts, value: tmp };
   }
   if (f.optional && ((type.kind === "Model" && (type as Model).name) || type.kind === "Union")) {
-    const tmp = `_tmp`;
+    const tmp = `_tmp${fieldReadCounter++}`;
     const sn = toSnakeCase(type.kind === "Model" ? (type as Model).name! : (type as Union).name!);
-    L.push(`${indent}if r.is_null():`);
-    L.push(`${indent}    ${tmp} = None`);
-    L.push(`${indent}    r.read_null()`);
-    L.push(`${indent}else:`);
-    L.push(`${indent}    ${tmp} = decode_${sn}(r)`);
-    return tmp;
+    const stmts: string[] = [];
+    stmts.push(`${tmp} = None`);
+    stmts.push(`if r.is_null():`);
+    stmts.push(`    r.read_null()`);
+    stmts.push(`else:`);
+    stmts.push(`    ${tmp} = decode_${sn}(r)`);
+    return { stmts, value: tmp };
   }
-  return readExpr(type);
+  return { stmts: [], value: readExpr(type) };
 }
 
 function emitModelFunctions(m: Model, L: string[]): void {
@@ -204,8 +217,16 @@ function emitModelFunctions(m: Model, L: string[]): void {
   fieldReadCounter = 0;
   for (const f of fields) {
     const fPy = fieldPy(f.name);
-    const val = generateFieldRead(L, f, "        ");
-    L.push(`        if key == "${f.name}": kw["${fPy}"] = ${val}; continue`);
+    const result = generateFieldRead(f);
+    if (result.stmts.length > 0) {
+      L.push(`        if key == "${f.name}":`);
+      for (const stmt of result.stmts) {
+        L.push(`            ${stmt}`);
+      }
+      L.push(`            kw["${fPy}"] = ${result.value}; continue`);
+    } else {
+      L.push(`        if key == "${f.name}": kw["${fPy}"] = ${result.value}; continue`);
+    }
   }
   L.push(`        r.skip()`);
   L.push(`    r.end_object()`);
