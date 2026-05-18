@@ -117,7 +117,7 @@ function generateFieldRead(L: string[], f: { name: string; type: Type; optional:
   const type = f.type;
   if (isArrayType(type)) {
     const elem = arrayElementType(type)!;
-    const tmp = `_tmp${fieldReadCounter++}`;
+    const tmp = `_tmp`;
     const elemRead = readExpr(elem);
     const inner = f.optional ? `    ` : ``;
     if (f.optional) {
@@ -135,7 +135,7 @@ function generateFieldRead(L: string[], f: { name: string; type: Type; optional:
   }
   if (isRecordType(type)) {
     const elem = recordElementType(type)!;
-    const tmp = `_tmp${fieldReadCounter++}`;
+    const tmp = `_tmp`;
     const elemRead = readExpr(elem);
     const inner = f.optional ? `    ` : ``;
     if (f.optional) {
@@ -152,7 +152,7 @@ function generateFieldRead(L: string[], f: { name: string; type: Type; optional:
     return tmp;
   }
   if (f.optional && ((type.kind === "Model" && (type as Model).name) || type.kind === "Union")) {
-    const tmp = `_tmp${fieldReadCounter++}`;
+    const tmp = `_tmp`;
     const sn = toSnakeCase(type.kind === "Model" ? (type as Model).name! : (type as Union).name!);
     L.push(`${indent}if r.is_null():`);
     L.push(`${indent}    ${tmp} = None`);
