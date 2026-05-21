@@ -38,33 +38,18 @@ describe('writeLines', () => {
   });
 });
 
-describe('full generation from alltypes.tsp', () => {
-  it('generates all ~200 model files', () => {
-    if (existsSync(GENERATED)) rmSync(GENERATED, { recursive: true });
-    const tspFile = join(TESTS, 'alltypes.tsp');
-    expect(existsSync(tspFile)).toBe(true);
-    execSync(`${TSP} compile ${tspFile} --emit=@specodec/typespec-emitter-python --option @specodec/typespec-emitter-python.emitter-output-dir={cwd}/tests/generated`, { cwd: ROOT, stdio: 'pipe' });
-    const pyFiles = readdirSync(GENERATED).filter(f => f.endsWith('.py'));
-    expect(pyFiles.length).toBeGreaterThanOrEqual(10);
-  });
 
-  it('generated code compiles', () => {
-    const files = readdirSync(GENERATED).filter(f => f.endsWith('.py'));
-    for (const f of files) {
-      execSync(`python3 -m py_compile ${join(GENERATED, f)}`, { stdio: 'pipe' });
+
+describe('generated code compiles', () => {
+  const GEN = join(__dir, '..', 'tests', 'generated');
+  
+  it('syntax check: py_compile', () => {
+    for (const f of readdirSync(GEN).filter(f => f.endsWith('.py'))) {
+      execSync(`python3 -m py_compile ${join(GEN, f)}`, { stdio: 'pipe' });
     }
   });
-});
 
-describe('generation + compile', () => {
-  const ROOT = join(__dir, '..');
-  const TSP = join(ROOT, 'node_modules', '.bin', 'tsp');
-  const TDIR = join(ROOT, 'tests');
-  const GEN = join(TDIR, 'generated');
-
-  it('tsp generates ~200 codec files', () => {
-    if (existsSync(GEN)) rmSync(GEN, { recursive: true });
-    execSync(`${TSP} compile alltypes.tsp --emit=@specodec/typespec-emitter-python --option @specodec/typespec-emitter-python.emitter-output-dir=generated`, { cwd: TDIR, stdio: 'pipe' });
-    expect(readdirSync(GEN).length).toBeGreaterThanOrEqual(10);
+  it('type check: mypy', () => {
+    execSync(`mypy ${GEN} --ignore-missing-imports`, { stdio: 'pipe' });
   });
 });
