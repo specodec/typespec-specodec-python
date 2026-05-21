@@ -22,11 +22,11 @@ import {
 
 export type EmitterOptions = BaseEmitterOptions;
 
-function fieldPy(name: string): string {
+export function fieldPy(name: string): string {
   return safeFieldName("python", toSnakeCase(name));
 }
 
-function typeToPython(type: Type, optional: boolean = false): string {
+export function typeToPython(type: Type, optional: boolean = false): string {
   const n = scalarName(type);
   let base = "";
   if (n === "string") base = "str";
@@ -47,7 +47,7 @@ function typeToPython(type: Type, optional: boolean = false): string {
 let writeLoopCounter = 0;
 let fieldReadCounter = 0;
 
-function writeLines(type: Type, varExpr: string, indent: string): string[] {
+export function writeLines(type: Type, varExpr: string, indent: string): string[] {
   const n = scalarName(type);
   if (n === "string") return [`${indent}w.write_string(${varExpr})`];
   if (n === "boolean") return [`${indent}w.write_bool(${varExpr})`];
@@ -90,7 +90,7 @@ function writeLines(type: Type, varExpr: string, indent: string): string[] {
   return [`${indent}w.write_string(str(${varExpr}))`];
 }
 
-function readExpr(type: Type, optional?: boolean): string {
+export function readExpr(type: Type, optional?: boolean): string {
   const n = scalarName(type);
   if (n === "string") return `r.read_string()`;
   if (n === "boolean") return `r.read_bool()`;
@@ -113,7 +113,7 @@ function readExpr(type: Type, optional?: boolean): string {
 }
 
 
-function generateFieldRead(f: { name: string; type: Type; optional: boolean }): { stmts: string[], value: string } {
+export function generateFieldRead(f: { name: string; type: Type; optional: boolean }): { stmts: string[], value: string } {
   const type = f.type;
   if (isArrayType(type)) {
     const elem = arrayElementType(type)!;
@@ -177,7 +177,7 @@ function generateFieldRead(f: { name: string; type: Type; optional: boolean }): 
   return { stmts: [], value: readExpr(type) };
 }
 
-function generateModelCode(m: Model): string {
+export function generateModelCode(m: Model): string {
   if (!m.name) return;
   const lines: string[] = [];
   const fields = extractFields(m);
@@ -236,7 +236,7 @@ function generateModelCode(m: Model): string {
   return lines.join("\n");
 }
 
-function generateEnumCode(e: EnumInfo): string[] {
+export function generateEnumCode(e: EnumInfo): string[] {
   const lines: string[] = [];
   lines.push(`class ${e.name}(enum.IntEnum):`);
   for (const m of e.members) {
