@@ -1,0 +1,7 @@
+{
+  "name": "specodec-emitter-python-tests",
+  "private": true,
+  "dependencies": {
+    "@specodec/typespec-emitter-python": "file:.."
+  }
+}
