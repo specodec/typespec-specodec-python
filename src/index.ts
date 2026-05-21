@@ -177,61 +177,63 @@ function generateFieldRead(f: { name: string; type: Type; optional: boolean }): 
   return { stmts: [], value: readExpr(type) };
 }
 
-function emitModelFunctions(m: Model, L: string[]): void {
+function generateModelCode(m: Model): string {
   if (!m.name) return;
+  const lines: string[] = [];
   const fields = extractFields(m);
   const required = fields.filter((f) => !f.optional);
   const optional = fields.filter((f) => f.optional);
   const sn = toSnakeCase(m.name);
 
-  L.push(`def write_${sn}(w: SpecWriter, obj: ${m.name}) -> None:`);
+  lines.push(`def write_${sn}(w: SpecWriter, obj: ${m.name}) -> None:`);
   if (optional.length === 0) {
-    L.push(`    w.begin_object(${fields.length})`);
+    lines.push(`    w.begin_object(${fields.length})`);
   } else {
-    L.push(`    field_count = ${required.length}`);
+    lines.push(`    field_count = ${required.length}`);
     for (const f of optional) {
       const fPy = fieldPy(f.name);
-      L.push(`    if obj.${fPy} is not None: field_count += 1`);
+      lines.push(`    if obj.${fPy} is not None: field_count += 1`);
     }
-    L.push(`    w.begin_object(field_count)`);
+    lines.push(`    w.begin_object(field_count)`);
   }
   for (const f of fields) {
     const fPy = fieldPy(f.name);
     if (f.optional) {
-      L.push(`    if obj.${fPy} is not None:`);
-      L.push(`        w.write_field("${f.name}")`);
-      for (const line of writeLines(f.type, `obj.${fPy}`, "        ")) L.push(line);
+      lines.push(`    if obj.${fPy} is not None:`);
+      lines.push(`        w.write_field("${f.name}")`);
+      for (const line of writeLines(f.type, `obj.${fPy}`, "        ")) lines.push(line);
     } else {
-      L.push(`    w.write_field("${f.name}")`);
-      for (const line of writeLines(f.type, `obj.${fPy}`, "    ")) L.push(line);
+      lines.push(`    w.write_field("${f.name}")`);
+      for (const line of writeLines(f.type, `obj.${fPy}`, "    ")) lines.push(line);
     }
   }
-  L.push(`    w.end_object()`);
-  L.push("");
+  lines.push(`    w.end_object()`);
+  lines.push("");
 
-  L.push(`def decode_${sn}(r: SpecReader) -> ${m.name}:`);
-  L.push(`    kw: dict = {}`);
-  L.push(`    r.begin_object()`);
-  L.push(`    while r.has_next_field():`);
-  L.push(`        key = r.read_field_name()`);
+  lines.push(`def decode_${sn}(r: SpecReader) -> ${m.name}:`);
+  lines.push(`    kw: dict = {}`);
+  lines.push(`    r.begin_object()`);
+  lines.push(`    while r.has_next_field():`);
+  lines.push(`        key = r.read_field_name()`);
   fieldReadCounter = 0;
   for (const f of fields) {
     const fPy = fieldPy(f.name);
     const result = generateFieldRead(f);
     if (result.stmts.length > 0) {
-      L.push(`        if key == "${f.name}":`);
+      lines.push(`        if key == "${f.name}":`);
       for (const stmt of result.stmts) {
-        L.push(`            ${stmt}`);
+        lines.push(`            ${stmt}`);
       }
-      L.push(`            kw["${fPy}"] = ${result.value}; continue`);
+      lines.push(`            kw["${fPy}"] = ${result.value}; continue`);
     } else {
-      L.push(`        if key == "${f.name}": kw["${fPy}"] = ${result.value}; continue`);
+      lines.push(`        if key == "${f.name}": kw["${fPy}"] = ${result.value}; continue`);
     }
   }
-  L.push(`        r.skip()`);
-  L.push(`    r.end_object()`);
-  L.push(`    return ${m.name}(**kw)`);
-  L.push("");
+  lines.push(`        r.skip()`);
+  lines.push(`    r.end_object()`);
+  lines.push(`    return ${m.name}(**kw)`);
+  lines.push("");
+  return lines.join("\n");
 }
 
 function generateEnumCode(e: EnumInfo): string[] {
@@ -393,7 +395,7 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
       generateUnionCode(u, L);
     }
 
-    for (const m of svc.models) emitModelFunctions(m, L);
+    for (const m of svc.models) L.push(generateModelCode(m));
 
     for (const m of svc.models) {
       if (!m.name) continue;
